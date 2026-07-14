@@ -1,11 +1,16 @@
 # =====================================================================
-# 로그/비용 데이터 저장용 S3 버킷 모음
+# 로그/비용 데이터 저장용 S3 버킷 모음 (독립 state)
+#   메인 인프라(terraform destroy) 와 완전히 분리되어 있어야
+#   실수로 로그 버킷까지 같이 삭제되는 사고를 막을 수 있다.
+#   메인 쪽에서는 이 버킷들을 data source 로만 "참조"한다 (소유하지 않음).
+#
 #   - access_logs      : S3 서버 액세스 로그 (이미지/프론트 버킷)
 #   - alb_logs         : ALB 액세스 로그
 #   - cf_logs          : CloudFront 액세스 로그
 #   - flow_logs        : VPC Flow Logs
 #   - cloudtrail_logs  : CloudTrail 이벤트 로그
 #   - cur_bucket       : Cost and Usage Report
+#   - traffic_logs     : 트래픽 PoC ground-truth 로그
 # =====================================================================
 
 data "aws_caller_identity" "current" {}
@@ -18,7 +23,11 @@ data "aws_elb_service_account" "main" {}
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "access_logs" {
   bucket        = "${var.log_bucket_prefix}-s3-access-logs"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "s3-access-logs"
@@ -45,7 +54,11 @@ resource "aws_s3_bucket_acl" "access_logs" {
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "alb_logs" {
   bucket        = "${var.log_bucket_prefix}-alb-logs"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "alb-logs"
@@ -77,7 +90,11 @@ resource "aws_s3_bucket_policy" "alb_logs" {
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "cf_logs" {
   bucket        = "${var.log_bucket_prefix}-cf-logs"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "cloudfront-logs"
@@ -103,7 +120,11 @@ resource "aws_s3_bucket_acl" "cf_logs" {
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "flow_logs" {
   bucket        = "${var.log_bucket_prefix}-vpc-flow-logs"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "vpc-flow-logs"
@@ -116,7 +137,11 @@ resource "aws_s3_bucket" "flow_logs" {
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "cloudtrail_logs" {
   bucket        = "${var.log_bucket_prefix}-cloudtrail-logs"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "cloudtrail-logs"
@@ -158,7 +183,11 @@ resource "aws_s3_bucket_policy" "cloudtrail_logs" {
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "cur_bucket" {
   bucket        = "${var.log_bucket_prefix}-cur"
-  force_destroy = true
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = {
     Name      = "cost-usage-report"
@@ -197,4 +226,21 @@ resource "aws_s3_bucket_policy" "cur_bucket" {
       }
     ]
   })
+}
+
+# ---------------------------------------------------------------------
+# 7) 트래픽 PoC ground-truth 로그 버킷
+# ---------------------------------------------------------------------
+resource "aws_s3_bucket" "traffic_logs" {
+  bucket        = "${var.log_bucket_prefix}-traffic-logs"
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  tags = {
+    Name      = "traffic-logs"
+    component = "poc-traffic"
+  }
 }

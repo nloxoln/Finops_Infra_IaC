@@ -6,7 +6,7 @@ resource "aws_lb" "app_alb" {
   subnets            = aws_subnet.public[*].id
 
   access_logs {
-    bucket  = aws_s3_bucket.alb_logs.id
+    bucket  = data.aws_s3_bucket.alb_logs.id
     prefix  = "alb"
     enabled = true
   }

@@ -122,7 +122,7 @@ resource "aws_cloudfront_distribution" "cdn" {
 
   logging_config {
     include_cookies = false
-    bucket          = aws_s3_bucket.cf_logs.bucket_domain_name
+    bucket          = data.aws_s3_bucket.cf_logs.bucket_domain_name
     prefix          = "cloudfront/"
   }
 }

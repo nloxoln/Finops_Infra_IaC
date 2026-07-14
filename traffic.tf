@@ -7,16 +7,8 @@
 
 # ---------------------------------------------------------------------
 # 0) ground-truth 트래픽 로그 전용 버킷
+#    log-buckets/ 의 독립 state 에서 관리 → 여기서는 data source 로만 참조
 # ---------------------------------------------------------------------
-resource "aws_s3_bucket" "traffic_logs" {
-  bucket        = "${var.log_bucket_prefix}-traffic-logs"
-  force_destroy = true
-
-  tags = {
-    Name      = "traffic-logs"
-    component = "poc-traffic"
-  }
-}
 
 # 참고: 상품 이미지(products/1.png ~ products/16.png)는 이미 olive-product 버킷에
 #       업로드되어 있으므로 별도 업로드 리소스는 두지 않는다.
@@ -65,7 +57,7 @@ resource "aws_iam_role_policy" "traffic_lambda_s3" {
     Statement = [{
       Effect   = "Allow"
       Action   = "s3:PutObject"
-      Resource = "${aws_s3_bucket.traffic_logs.arn}/*"
+      Resource = "${data.aws_s3_bucket.traffic_logs.arn}/*"
     }]
   })
 }
@@ -87,7 +79,7 @@ resource "aws_lambda_function" "traffic_generator" {
     variables = {
       ALB_ENDPOINT      = "http://${aws_lb.app_alb.dns_name}"
       CLOUDFRONT_DOMAIN = aws_cloudfront_distribution.cdn.domain_name
-      LOG_BUCKET        = aws_s3_bucket.traffic_logs.id
+      LOG_BUCKET        = data.aws_s3_bucket.traffic_logs.id
     }
   }
 
@@ -111,7 +103,7 @@ resource "aws_lambda_function" "anomaly_injector" {
     variables = {
       ALB_ENDPOINT      = "http://${aws_lb.app_alb.dns_name}"
       CLOUDFRONT_DOMAIN = aws_cloudfront_distribution.cdn.domain_name
-      LOG_BUCKET        = aws_s3_bucket.traffic_logs.id
+      LOG_BUCKET        = data.aws_s3_bucket.traffic_logs.id
       ANOMALY_TYPE      = "CACHE_MISS_SPAM" # 주입 시 콘솔/CLI 로 변경
       ANOMALY_MULTIPLIER = "5"
     }
@@ -171,7 +163,7 @@ resource "aws_scheduler_schedule" "traffic_generator" {
 # 7) 출력값
 # ---------------------------------------------------------------------
 output "traffic_log_bucket" {
-  value = aws_s3_bucket.traffic_logs.id
+  value = data.aws_s3_bucket.traffic_logs.id
 }
 
 output "anomaly_injector_function_name" {
