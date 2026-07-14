@@ -1,0 +1,25 @@
+# ===== Terraform =====
+# state 파일: 액세스 키·DB 비밀번호가 평문으로 저장됨 → 절대 커밋 금지
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# 변수 파일: db_password 등 민감값
+*.tfvars
+*.auto.tfvars
+
+# 로컬 초기화/캐시
+.terraform/
+crash.log
+crash.*.log
+# .terraform.lock.hcl 은 팀 버전 고정용이라 커밋하는 게 정석 (제외 안 함)
+
+# override 파일
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# 기타
+*.pem
+.env
