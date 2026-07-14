@@ -70,6 +70,7 @@ resource "aws_s3_bucket_policy" "alb_logs" {
   })
 }
 
+
 # ---------------------------------------------------------------------
 # 3) CloudFront 액세스 로그 버킷
 #    (CloudFront 표준 로깅은 ACL 기반 → ownership/ACL 설정 필요)

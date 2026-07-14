@@ -41,7 +41,7 @@ resource "aws_s3_bucket_policy" "static_assets" {
         Resource  = "${aws_s3_bucket.static_assets.arn}/*"
         Condition = {
           StringEquals = {
-            "AWS:SourceArn" = aws_cloudfront_distribution.cdn.arn
+            "AWS:SourceArn" = aws_cloudfront_distribution.cdn.domain_name
           }
         }
       }

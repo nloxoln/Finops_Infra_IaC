@@ -15,10 +15,6 @@ output "cloudfront_distribution_id" {
   value = aws_cloudfront_distribution.cdn.id
 }
 
-output "static_bucket_name" {
-  value = aws_s3_bucket.static_assets.id
-}
-
 # ===== GitHub Secrets 에 넣을 값 =====
 # 조회: terraform output -raw github_actions_access_key_id
 #       terraform output -raw github_actions_secret_access_key
@@ -34,6 +30,11 @@ output "github_actions_secret_access_key" {
 output "rds_endpoint" {
   value = aws_db_instance.postgresql.endpoint
 }
+
+output "static_bucket_name" {
+  value = aws_s3_bucket.static_assets.id
+}
+
 
 output "route53_zone_id" {
   value = aws_route53_zone.main.zone_id
