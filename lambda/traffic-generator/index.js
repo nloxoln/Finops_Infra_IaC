@@ -28,7 +28,7 @@ const ROUTE_WEIGHTS = [
 const POPULAR_PRODUCT_IDS = Array.from({ length: 16 }, (_, i) => i + 1);
 const LONGTAIL_PRODUCT_ID_RANGE = [17, 9999];
 
-const BASE_REQUESTS_PER_RUN = 15; // 12분당 기본 요청 수 — 1일차 실측 후 예산 맞춰 튜닝
+const BASE_REQUESTS_PER_RUN = 1000; // 12분당 기본 요청 수 
 
 function pickWeightedRoute() {
   const r = Math.random();

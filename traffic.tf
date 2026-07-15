@@ -72,7 +72,7 @@ resource "aws_lambda_function" "traffic_generator" {
   handler          = "index.handler"
   filename         = data.archive_file.traffic_generator.output_path
   source_code_hash = data.archive_file.traffic_generator.output_base64sha256
-  timeout          = 120
+  timeout          = 700
   memory_size      = 256
 
   environment {
@@ -96,7 +96,7 @@ resource "aws_lambda_function" "anomaly_injector" {
   handler          = "index.handler"
   filename         = data.archive_file.anomaly_injector.output_path
   source_code_hash = data.archive_file.anomaly_injector.output_base64sha256
-  timeout          = 300
+  timeout          = 800
   memory_size      = 256
 
   environment {
@@ -105,7 +105,7 @@ resource "aws_lambda_function" "anomaly_injector" {
       CLOUDFRONT_DOMAIN = aws_cloudfront_distribution.cdn.domain_name
       LOG_BUCKET        = data.aws_s3_bucket.traffic_logs.id
       ANOMALY_TYPE      = "CACHE_MISS_SPAM" # 주입 시 콘솔/CLI 로 변경
-      ANOMALY_MULTIPLIER = "5"
+      ANOMALY_MULTIPLIER = "100"
     }
   }
 
