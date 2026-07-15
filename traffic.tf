@@ -113,7 +113,7 @@ resource "aws_lambda_function" "anomaly_injector" {
 }
 
 # ---------------------------------------------------------------------
-# 6) EventBridge Scheduler — 12분 간격, 화~금 09~18시 KST
+# 6) EventBridge Scheduler — 12분 간격, 화~토 09~18시 KST
 #    cron(분 시 일 월 요일 년), timezone=Asia/Seoul 로 KST 직접 표현
 #    → 매시 0/12/24/36/48분, 9~18시, 월~금(MON-FRI)
 # ---------------------------------------------------------------------
@@ -150,7 +150,7 @@ resource "aws_scheduler_schedule" "traffic_generator" {
   }
 
   # 화~금만 작업(MON-FRI 중 화~금은 TUE-FRI). 필요 시 MON-FRI 로 확대 가능.
-  schedule_expression          = "cron(0/12 9-18 ? * TUE-FRI *)"
+  schedule_expression          = "cron(0/12 9-18 ? * TUE-SAT *)"
   schedule_expression_timezone = "Asia/Seoul"
 
   target {
