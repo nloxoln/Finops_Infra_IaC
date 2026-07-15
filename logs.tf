@@ -1,67 +1,17 @@
-resource "aws_cloudtrail" "main" {
-  name                          = "cost-poc-trail"
-  s3_bucket_name                = data.aws_s3_bucket.cloudtrail_logs.id
-  include_global_service_events = true
-  is_multi_region_trail         = false
+# =====================================================================
+# 비용 데이터 수집 — CUR 만 유지.
+#
+# [정리 이력] estimator 가 CloudWatch 네이티브 지표만 사용하므로,
+#   비용에 기여하기만 하고 아무도 소비하지 않던 로그 수집을 전부 제거했다:
+#   - CloudTrail (관리/데이터 이벤트)        → EC2 스펙변경 감지는 EventBridge 로 대체 가능(트레일 불필요)
+#   - S3 서버 액세스 로그 (이미지/정적 버킷)  → 미사용
+#   - S3 request metrics (EntireBucket)      → CloudWatch 유료 지표, 미사용
+#   - VPC Flow Logs                          → 미사용
+#   - ALB 액세스 로그 (alb_ec2.tf)           → 미사용 (블록 제거됨)
+#   - CloudFront 액세스 로그 (cloudfront.tf) → 미사용 (블록 제거됨)
+# =====================================================================
 
-  event_selector {
-    read_write_type           = "All"
-    include_management_events = true
-
-    # 이미지 버킷 + 프론트 캐시 버킷 두 개 모두 데이터 이벤트 수집
-    data_resource {
-      type = "AWS::S3::Object"
-      values = [
-        "${aws_s3_bucket.product_images.arn}/",
-        "${aws_s3_bucket.static_assets.arn}/",
-      ]
-    }
-  }
-
-  tags = {
-    Name      = "cost-poc-trail"
-    component = "logging-cloudtrail"
-  }
-}
-
-# ---- 이미지 버킷: 서버 액세스 로그 + 요청 메트릭 ----
-resource "aws_s3_bucket_logging" "product_images" {
-  bucket        = aws_s3_bucket.product_images.id
-  target_bucket = data.aws_s3_bucket.access_logs.id
-  target_prefix = "s3-images/"
-}
-
-resource "aws_s3_bucket_metric" "product_images_requests" {
-  bucket = aws_s3_bucket.product_images.id
-  name   = "EntireBucket"
-}
-
-# ---- 프론트 캐시(static) 버킷: 서버 액세스 로그 + 요청 메트릭 ----
-resource "aws_s3_bucket_logging" "static_assets" {
-  bucket        = aws_s3_bucket.static_assets.id
-  target_bucket = data.aws_s3_bucket.access_logs.id
-  target_prefix = "s3-static/"
-}
-
-resource "aws_s3_bucket_metric" "static_assets_requests" {
-  bucket = aws_s3_bucket.static_assets.id
-  name   = "EntireBucket"
-}
-
-# ---- VPC Flow Logs (VPC 단위, S3 저장) ----
-resource "aws_flow_log" "vpc" {
-  vpc_id               = aws_vpc.main.id
-  traffic_type         = "ALL"
-  log_destination_type = "s3"
-  log_destination      = data.aws_s3_bucket.flow_logs.arn
-
-  tags = {
-    Name      = "vpc-flow-log"
-    component = "logging-vpc-flow"
-  }
-}
-
-# ---- CUR (Cost and Usage Report) ----
+# ---- CUR (Cost and Usage Report) — 월간 종합보고서 전용 ----
 # CUR API 는 us-east-1 에만 존재하므로 해당 provider 사용
 resource "aws_cur_report_definition" "main" {
   provider                   = aws.us_east_1

@@ -113,9 +113,12 @@ resource "aws_lambda_function" "anomaly_injector" {
 }
 
 # ---------------------------------------------------------------------
-# 6) EventBridge Scheduler — 12분 간격, 화~토 09~18시 KST
+# 6) EventBridge Scheduler — 12분 간격, 매일 09~18시 KST
 #    cron(분 시 일 월 요일 년), timezone=Asia/Seoul 로 KST 직접 표현
-#    → 매시 0/12/24/36/48분, 9~18시, 월~금(MON-FRI)
+#    → 매시 0/12/24/36/48분, 9~18시, "매일"(요일 무관)
+#    [변경] 발표 일정상 정상 데이터가 목·금·토·일 4일 연속 필요하고,
+#           월요일 비정상 주입 테스트 때도 정상 baseline 이 흘러야 하므로
+#           TUE-SAT → 매일(*)로 확대. (요일별 계절성은 쓰지 않고 시간대별만 사용)
 # ---------------------------------------------------------------------
 resource "aws_iam_role" "scheduler" {
   name = "traffic-scheduler-role"
@@ -149,8 +152,8 @@ resource "aws_scheduler_schedule" "traffic_generator" {
     mode = "OFF"
   }
 
-  # 화~금만 작업(MON-FRI 중 화~금은 TUE-FRI). 필요 시 MON-FRI 로 확대 가능.
-  schedule_expression          = "cron(0/12 9-18 ? * TUE-SAT *)"
+  # 매일 09~18시 KST, 12분 간격. (요일 무관 → 목~월 연속 baseline 확보)
+  schedule_expression          = "cron(0/12 9-18 * * ? *)"
   schedule_expression_timezone = "Asia/Seoul"
 
   target {

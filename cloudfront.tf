@@ -120,9 +120,5 @@ resource "aws_cloudfront_distribution" "cdn" {
     component = "cloudfront"
   }
 
-  logging_config {
-    include_cookies = false
-    bucket          = data.aws_s3_bucket.cf_logs.bucket_domain_name
-    prefix          = "cloudfront/"
-  }
+  # [정리] CloudFront 액세스 로그는 미사용이라 제거. 추정기는 CloudWatch 지표(Requests/BytesDownloaded) 사용.
 }

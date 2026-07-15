@@ -5,11 +5,7 @@ resource "aws_lb" "app_alb" {
   security_groups    = [aws_security_group.alb_sg.id]
   subnets            = aws_subnet.public[*].id
 
-  access_logs {
-    bucket  = data.aws_s3_bucket.alb_logs.id
-    prefix  = "alb"
-    enabled = true
-  }
+  # [정리] ALB 액세스 로그는 미사용이라 제거 (S3 저장 비용 절감). 추정기는 CloudWatch 지표(ConsumedLCUs 등) 사용.
 
   tags = {
     Name      = "app-alb"
