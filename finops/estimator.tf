@@ -152,10 +152,10 @@ resource "aws_iam_role_policy" "reconciler_permissions" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = ["ce:GetCostAndUsage"], Resource = "*" },
-      { Effect = "Allow", Action = [
-        "dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"
-      ], Resource = aws_dynamodb_table.cost_estimates.arn }
+      { Effect = "Allow", Action = ["s3:GetObject", "s3:ListBucket"],
+        Resource = ["arn:aws:s3:::oliveyoung-costpoc-cur", "arn:aws:s3:::oliveyoung-costpoc-cur/*"] },
+      { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"],
+        Resource = aws_dynamodb_table.cost_estimates.arn }
     ]
   })
 }
@@ -174,11 +174,11 @@ resource "aws_lambda_function" "reconciler" {
     variables = {
       DDB_TABLE     = aws_dynamodb_table.cost_estimates.name
       REGION        = local.finops_region
-      ACCOUNT_ID    = local.finops_account_id
       LEARNING_RATE = "0.3"
-      # CE 시간별 데이터 반영 지연(~48h) 고려해 기본 T-2 보정.
-      # CE 데이터가 더 빨리 확정되면 1 로 낮춰 보정 횟수를 늘릴 수 있음(4일 제약 대응).
       RECONCILE_LAG_DAYS = "2"
+      CUR_BUCKET = "oliveyoung-costpoc-cur"
+      CUR_PREFIX = "cur"
+      CUR_REPORT = "cost-poc-cur"
     }
   }
 
@@ -195,6 +195,7 @@ resource "aws_iam_role" "estimator_scheduler" {
     Statement = [{ Effect = "Allow", Principal = { Service = "scheduler.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
 }
+
 
 resource "aws_iam_role_policy" "estimator_scheduler_invoke" {
   name = "finops-estimator-scheduler-invoke"
