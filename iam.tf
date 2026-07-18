@@ -23,10 +23,32 @@ resource "aws_iam_role_policy_attachment" "ec2_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+resource "aws_iam_role_policy_attachment" "cwagent" {
+  role       = aws_iam_role.ec2_role.name   # ec2_profile이 참조하는 role 이름으로
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# EC2 부팅 시 CloudWatch Agent 가 SSM 파라미터에서 읽어갈 설정
+resource "aws_ssm_parameter" "cwagent_config" {
+  name  = "/cost-poc/cwagent-config"
+  type  = "String"
+  value = file("${path.module}/cwagent-config.json")
+
+  tags = {
+    Name      = "cwagent-config"
+    component = "ec2"
+  }
+}
+
 resource "aws_iam_instance_profile" "ec2_profile" {
   name = "ec2-app-profile"
   role = aws_iam_role.ec2_role.name
 }
+
+
+
+
+
 
 # ===== CodeDeploy 서비스 역할 =====
 resource "aws_iam_role" "codedeploy_role" {
@@ -45,6 +67,12 @@ resource "aws_iam_role_policy_attachment" "codedeploy" {
   role       = aws_iam_role.codedeploy_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
 }
+
+
+
+
+
+
 
 # ===== GitHub Actions 배포용 IAM 사용자 =====
 # GitHub Secrets(AWS_ACCESS_KEY_ID/SECRET)에 넣을 자격증명.
@@ -125,19 +153,3 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
 }
 
-resource "aws_iam_role_policy_attachment" "cwagent" {
-  role       = aws_iam_role.ec2_role.name   # ec2_profile이 참조하는 role 이름으로
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
-# EC2 부팅 시 CloudWatch Agent 가 SSM 파라미터에서 읽어갈 설정
-resource "aws_ssm_parameter" "cwagent_config" {
-  name  = "/cost-poc/cwagent-config"
-  type  = "String"
-  value = file("${path.module}/cwagent-config.json")
-
-  tags = {
-    Name      = "cwagent-config"
-    component = "ec2"
-  }
-}

@@ -1,188 +1,294 @@
-// index.mjs — reconciler (일별 보정기)
-// Runtime: Node.js 20.x
+// index.mjs — reconciler (일별 보정기) · CUR(CSV/GZIP) 기반 · KST 창(window) 지원
+// Runtime: Node.js 20.x  (AWS SDK v3 런타임 내장, 외부 의존성 없음)
 //
-// 매일 05:00 KST 에 EventBridge Scheduler 가 실행.
-// Cost Explorer HOURLY 데이터는 반영에 ~48시간 걸리므로 T-2(이틀 전) 하루치를 대상으로 한다.
-//   1) ce:GetCostAndUsage (HOURLY + SERVICE 그룹, LINKED_ACCOUNT 필터)로 "실제 비용"을 받고
-//   2) DynamoDB 에 저장해둔 그날의 추정치(EST#)를 조인해
-//   3) 서비스별 오차(MAPE)와 실제/추정 비율을 계산,
-//   4) 보정계수를 EWMA 로 갱신(다음 추정에 반영)하고 정확도 리포트(ACC#)를 남긴다.
+// [변경 배경]
+//   CUR·EST# 는 전부 UTC 로 저장됨. 분석 대상이 "KST 특정 시각 이후"인 경우
+//   UTC day 하나로는 잡히지 않는다(예: KST 7/16 08:00 = UTC 7/15 23:00).
+//   → fromKST(시작 KST 시각)와 hours(창 길이)를 받아, 걸치는 UTC 날짜들의
+//     CUR + EST# 를 모두 읽고 [fromUTC, toUTC) 구간만 집계한다.
 //
-// 저장 최소화: CUR/Athena 를 쓰지 않는다(원본 스캔·보관 없음). CUR 는 월간 종합보고서 전용.
+// payload 예:
+//   {"fromKST":"2026-07-16T08:00","hours":24}   ← KST 7/16 08시부터 24시간
+//   {"day":"2026-07-14"}                          ← (호환) 그날 UTC 00~24시
+//   (없으면) T-2 하루치 UTC
+//
+// 저장 최소화: CUR 원본은 S3 lifecycle 로 자동 만료. 여기선 읽기만 하고
+//              집계 결과(ACC#/COEF#)만 DynamoDB 에 남긴다.
 
-import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient, QueryCommand, GetItemCommand, PutItemCommand } from "@aws-sdk/client-dynamodb";
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
+import { gunzipSync } from "node:zlib";
 
 const REGION = process.env.REGION || "ap-northeast-2";
-const ce = new CostExplorerClient({ region: "us-east-1" }); // CE 는 us-east-1
+const s3 = new S3Client({ region: REGION });
 const ddb = new DynamoDBClient({ region: REGION });
 
 const DDB_TABLE = process.env.DDB_TABLE;
-const ACCOUNT_ID = process.env.ACCOUNT_ID; // 올리브영 계정
+
+// ---- CUR 위치 ----
+const CUR_BUCKET = process.env.CUR_BUCKET;
+const CUR_PREFIX = process.env.CUR_PREFIX || "cur";
+const CUR_REPORT = process.env.CUR_REPORT || "cost-poc-cur";
+
+// ---- 보정 파라미터 ----
 const LEARNING_RATE = Number(process.env.LEARNING_RATE || 0.3);
-const RECONCILE_LAG_DAYS = Number(process.env.RECONCILE_LAG_DAYS || 2); // 기본 T-2 (CE 지연 대응)
+const RECONCILE_LAG_DAYS = Number(process.env.RECONCILE_LAG_DAYS || 2);
 const COEFF_MIN = 0.2;
 const COEFF_MAX = 5;
+const KST_OFFSET_H = 9; // KST = UTC + 9
+
+const FINOPS_MARKERS = (process.env.FINOPS_MARKERS ||
+  "finops-estimator,finops-reconciler,finops-cost-collector,finops-cost-reader,finops-cost-estimates,finops-cost-cache,finops-cur,cost-collector-scheduler,estimator-scheduler,reconciler-schedule"
+).split(",").map((s) => s.trim()).filter(Boolean);
+
+const KEEP_TYPES = new Set(["Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"]);
 
 const round4 = (n) => Math.round(n * 1e4) / 1e4;
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
-// Cost Explorer 서비스명 → 내부 서비스 id (추정기와 동일 체계)
-// 주의: "EC2 - Other"(NAT/EBS/EIP) 와 "…Compute"(인스턴스) 를 반드시 분리.
-const CE_SERVICE_MAP = [
-  { match: /EC2\s*-\s*Other/i, id: "ec2-other" },
-  { match: /Elastic Compute Cloud/i, id: "ec2" },
-  { match: /Relational Database/i, id: "rds" },
-  { match: /CloudFront/i, id: "cloudfront" },
-  { match: /Simple Storage Service|(^|\W)S3(\W|$)/i, id: "s3" },
-  { match: /Route\s*53/i, id: "route53" },
-  { match: /Elastic Load Balancing/i, id: "elb" },
-];
-const classify = (name) => CE_SERVICE_MAP.find((m) => m.match.test(name))?.id || null;
+function mapService(productCode, usageType, productName) {
+  const pc = (productCode || "").toLowerCase();
+  const ut = (usageType || "").toLowerCase();
+  const pn = (productName || "").toLowerCase();
+  if (pc.includes("elb") || pn.includes("load balancing")) return "elb";
+  if (pc.includes("cloudfront") || pn.includes("cloudfront")) return "cloudfront";
+  if (pc.includes("rds") || pn.includes("relational database")) return "rds";
+  if (pc === "amazons3" || pn.includes("simple storage")) return "s3";
+  if (pc.includes("route53") || pn.includes("route 53")) return "route53";
+  if (pc === "amazonec2" || pn.includes("elastic compute cloud")) {
+    if (ut.includes("natgateway") || ut.includes("ebs") || ut.includes("volumeusage") ||
+        ut.includes("snapshot") || ut.includes("elasticip") || ut.includes("address")) return "ec2-other";
+    if (ut.includes("boxusage") || ut.includes("spotusage") || ut.includes("dedicated") ||
+        ut.includes("cpucredit") || ut.includes("reservation")) return "ec2";
+    return "ec2-other";
+  }
+  return "others";
+}
+
+const isFinopsResource = (rid) => {
+  if (!rid) return false;
+  const low = rid.toLowerCase();
+  return FINOPS_MARKERS.some((m) => low.includes(m.toLowerCase()));
+};
+
+// ---- 시간 유틸 ----
+const utcDayStr = (d) => d.toISOString().slice(0, 10);        // YYYY-MM-DD
+const utcHourStr = (d) => d.toISOString().slice(0, 13);       // YYYY-MM-DDTHH
+
+// 창(window)이 걸치는 UTC 날짜 목록 (CUR/EST 읽을 날짜들)
+function utcDaysInWindow(fromUTC, toUTC) {
+  const days = new Set();
+  for (let t = Date.UTC(fromUTC.getUTCFullYear(), fromUTC.getUTCMonth(), fromUTC.getUTCDate());
+       t < toUTC.getTime(); t += 86400000) {
+    days.add(utcDayStr(new Date(t)));
+  }
+  // toUTC 가 자정 정각이 아니면 마지막 날도 포함되도록 보정
+  days.add(utcDayStr(fromUTC));
+  days.add(utcDayStr(new Date(toUTC.getTime() - 1)));
+  return Array.from(days).sort();
+}
+
+// 대상일이 속한 청구 기간 폴더명: YYYYMMDD-YYYYMMDD
+function billingPeriodFolder(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+  const end = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+  const fmt = (x) => x.toISOString().slice(0, 10).replace(/-/g, "");
+  return `${fmt(start)}-${fmt(end)}`;
+}
+
+async function getObjectBuffer(bucket, key) {
+  const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const chunks = [];
+  for await (const c of obj.Body) chunks.push(c);
+  return Buffer.concat(chunks);
+}
+
+async function readReportKeys(period) {
+  const manifestKey = `${CUR_PREFIX}/${CUR_REPORT}/${period}/${CUR_REPORT}-Manifest.json`;
+  const buf = await getObjectBuffer(CUR_BUCKET, manifestKey);
+  const manifest = JSON.parse(buf.toString("utf-8"));
+  return manifest.reportKeys || [];
+}
+
+function parseCsvLine(line) {
+  const out = []; let cur = ""; let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else {
+      if (ch === '"') inQ = true;
+      else if (ch === ",") { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// CSV 를 파싱해 [fromUTC, toUTC) 구간만 actual 에 누적
+function accumulateCsv(csvText, fromUTC, toUTC, actualHour, actualDay) {
+  const lines = csvText.split("\n");
+  if (lines.length < 2) return;
+  const header = parseCsvLine(lines[0]);
+  const idx = (name) => header.indexOf(name);
+  const iStart = idx("lineItem/UsageStartDate");
+  const iType = idx("lineItem/LineItemType");
+  const iProd = idx("lineItem/ProductCode");
+  const iUsage = idx("lineItem/UsageType");
+  const iRid = idx("lineItem/ResourceId");
+  const iCost = idx("lineItem/UnblendedCost");
+  const iPName = idx("product/ProductName");
+  if (iStart < 0 || iCost < 0) { console.warn("CUR 헤더 컬럼 못 찾음:", header.slice(0, 10)); return; }
+
+  for (let r = 1; r < lines.length; r++) {
+    if (!lines[r]) continue;
+    const cols = parseCsvLine(lines[r]);
+    const startStr = cols[iStart];
+    if (!startStr) continue;
+    const startT = new Date(startStr).getTime();          // CUR UsageStartDate 는 UTC
+    if (!(startT >= fromUTC.getTime() && startT < toUTC.getTime())) continue; // ★ KST 창 필터
+
+    const type = iType >= 0 ? cols[iType] : "Usage";
+    if (!KEEP_TYPES.has(type)) continue;
+    const rid = iRid >= 0 ? cols[iRid] : "";
+    if (isFinopsResource(rid)) continue;
+    const cost = parseFloat(cols[iCost] || "0");
+    if (!Number.isFinite(cost) || cost === 0) continue;
+
+    const svc = mapService(iProd >= 0 ? cols[iProd] : "", iUsage >= 0 ? cols[iUsage] : "", iPName >= 0 ? cols[iPName] : "");
+    const hour = utcHourStr(new Date(startT));
+    (actualHour[hour] ||= {});
+    actualHour[hour][svc] = (actualHour[hour][svc] || 0) + cost;
+    actualDay[svc] = (actualDay[svc] || 0) + cost;
+  }
+}
 
 async function getCoeff(service) {
   try {
     const r = await ddb.send(new GetItemCommand({ TableName: DDB_TABLE, Key: marshall({ pk: "COEF", sk: service }) }));
-    if (r.Item) {
-      const c = Number(unmarshall(r.Item).coeff);
-      if (Number.isFinite(c) && c > 0) return c;
-    }
-  } catch (e) {
-    console.warn(`보정계수 조회 실패(${service}):`, e.message);
-  }
+    if (r.Item) { const c = Number(unmarshall(r.Item).coeff); if (Number.isFinite(c) && c > 0) return c; }
+  } catch (e) { console.warn(`보정계수 조회 실패(${service}):`, e.message); }
   return 1;
 }
-
 async function putCoeff(service, coeff, iso) {
-  await ddb.send(
-    new PutItemCommand({
-      TableName: DDB_TABLE,
-      Item: marshall({ pk: "COEF", sk: service, coeff: round4(coeff), updatedAt: iso }),
-    })
-  );
+  await ddb.send(new PutItemCommand({
+    TableName: DDB_TABLE,
+    Item: marshall({ pk: "COEF", sk: service, type: "coeff", service, coeff: round4(coeff), updatedAt: iso }),
+  }));
 }
 
-export const handler = async (event = {}) => {
-  if (!DDB_TABLE) throw new Error("DDB_TABLE 미설정");
-  if (!ACCOUNT_ID) throw new Error("ACCOUNT_ID 미설정");
-
-  // 대상 하루 [start, end) UTC
-  // - 평상시: T-N (기본 N=2, CE 지연 대응)
-  // - 데모용: event.targetDay("YYYY-MM-DD") 를 주면 그 날짜를 즉시 보정
-  const now = new Date();
-  let start;
-  if (event.targetDay) {
-    start = new Date(`${event.targetDay}T00:00:00Z`);
-    if (Number.isNaN(start.getTime())) throw new Error(`잘못된 targetDay: ${event.targetDay}`);
-  } else {
-    const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-    start = new Date(todayUTC - RECONCILE_LAG_DAYS * 86400000);
-  }
-  const end = new Date(start.getTime() + 86400000);
-  const day = start.toISOString().slice(0, 10);
-  const startISO = start.toISOString().slice(0, 19) + "Z"; // 2026-07-13T00:00:00Z
-  const endISO = end.toISOString().slice(0, 19) + "Z";
-
-  // ── 1) 실제 비용 (CE HOURLY, 서비스별) ──
-  const res = await ce.send(
-    new GetCostAndUsageCommand({
-      TimePeriod: { Start: startISO, End: endISO },
-      Granularity: "HOURLY",
-      Metrics: ["UnblendedCost"],
-      GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }],
-      Filter: { Dimensions: { Key: "LINKED_ACCOUNT", Values: [ACCOUNT_ID] } },
-    })
-  );
-
-  const actual = {}; // service -> 하루 합계
-  for (const t of res.ResultsByTime || []) {
-    for (const g of t.Groups || []) {
-      const id = classify(g.Keys?.[0] || "");
-      if (!id) continue;
-      const c = parseFloat(g.Metrics?.UnblendedCost?.Amount || "0");
-      actual[id] = (actual[id] || 0) + c;
-    }
-  }
-
-  // ── 2) 저장된 추정치 (그날의 EST#) ──
-  const q = await ddb.send(
-    new QueryCommand({
+// 여러 UTC 날짜의 EST# 를 읽어 [fromUTC,toUTC) 시간대만 서비스별 합산
+async function loadEstimatesInWindow(utcDays, fromUTC, toUTC) {
+  const est = {}; // service -> {fixed, variable, estimated}
+  for (const day of utcDays) {
+    const q = await ddb.send(new QueryCommand({
       TableName: DDB_TABLE,
       KeyConditionExpression: "pk = :pk",
       ExpressionAttributeValues: marshall({ ":pk": `EST#${day}` }),
-    })
-  );
-  const est = {}; // service -> {fixed, variable, estimated}
-  for (const raw of q.Items || []) {
-    const it = unmarshall(raw);
-    if (it.type !== "estimate") continue;
-    const s = it.service;
-    if (!est[s]) est[s] = { fixed: 0, variable: 0, estimated: 0 };
-    est[s].fixed += it.fixed || 0;
-    est[s].variable += it.variable || 0;
-    est[s].estimated += it.estimated || 0;
+    }));
+    for (const raw of q.Items || []) {
+      const it = unmarshall(raw);
+      if (it.type !== "estimate") continue;
+      // it.hourUTC = "YYYY-MM-DDTHH" → 창 안인지 확인
+      const hT = new Date(`${it.hourUTC}:00:00Z`).getTime();
+      if (!(hT >= fromUTC.getTime() && hT < toUTC.getTime())) continue;
+      const s = it.service;
+      (est[s] ||= { fixed: 0, variable: 0, estimated: 0 });
+      est[s].fixed += it.fixed || 0;
+      est[s].variable += it.variable || 0;
+      est[s].estimated += it.estimated || 0;
+    }
+  }
+  return est;
+}
+
+export const handler = async (event) => {
+  const now = new Date();
+  const iso = now.toISOString();
+
+  // ── 대상 창 결정 ──
+  let fromUTC, toUTC, label;
+  if (event?.fromKST) {
+    // KST 시각 → UTC (KST - 9h). event.fromKST 예: "2026-07-16T08:00"
+    const kstMs = new Date(`${event.fromKST}:00+09:00`).getTime();
+    fromUTC = new Date(kstMs);
+    const hours = Number(event.hours || 24);
+    toUTC = new Date(kstMs + hours * 3600000);
+    label = `KST ${event.fromKST}(+${hours}h)`;
+  } else {
+    const day = event?.day || utcDayStr(new Date(now.getTime() - RECONCILE_LAG_DAYS * 86400000));
+    fromUTC = new Date(`${day}T00:00:00Z`);
+    toUTC = new Date(fromUTC.getTime() + 86400000);
+    label = `UTC ${day}`;
   }
 
-  // ── 3) 서비스별 조인 → 오차·비율 → 4) 보정계수 EWMA 갱신 ──
-  const iso = now.toISOString();
-  const services = Array.from(new Set([...Object.keys(est), ...Object.keys(actual)]));
+  const utcDays = utcDaysInWindow(fromUTC, toUTC);
+  const periods = Array.from(new Set(utcDays.map(billingPeriodFolder)));
+  console.log(`[reconciler] 대상=${label}  UTC창=[${fromUTC.toISOString()}, ${toUTC.toISOString()})  날짜=${utcDays} 기간=${periods}`);
+
+  // ── 1) CUR 읽어 실제 비용 집계 ──
+  const actualHour = {};
+  const actualDay = {};
+  for (const period of periods) {
+    let keys = [];
+    try { keys = await readReportKeys(period); }
+    catch (e) { console.warn(`manifest 조회 실패(${period}):`, e.message); continue; }
+    for (const key of keys) {
+      try {
+        const gz = await getObjectBuffer(CUR_BUCKET, key);
+        accumulateCsv(gunzipSync(gz).toString("utf-8"), fromUTC, toUTC, actualHour, actualDay);
+      } catch (e) { console.warn(`CUR 파일 처리 실패(${key}):`, e.message); }
+    }
+  }
+  const hoursSeen = Object.keys(actualHour).length;
+
+  // ── 2) 추정치(EST#) 창 안에서 로드 ──
+  const est = await loadEstimatesInWindow(utcDays, fromUTC, toUTC);
+
+  // ── 3) 조인 → 4) 계수 EWMA 갱신 ──
+  const services = Array.from(new Set([...Object.keys(est), ...Object.keys(actualDay)]));
   const report = [];
-  let sumActual = 0;
-  let sumAbsErr = 0;
+  let sumActual = 0, sumAbsErr = 0;
+  const accPk = `ACC#${event?.fromKST ? event.fromKST : (event?.day || utcDayStr(fromUTC))}`;
 
   for (const s of services) {
+    if (s === "others") { sumActual += actualDay[s] || 0; continue; }
     const e = est[s] || { fixed: 0, variable: 0, estimated: 0 };
-    const a = actual[s] || 0;
+    const a = actualDay[s] || 0;
     const estimatedTotal = e.estimated;
     const absErr = Math.abs(a - estimatedTotal);
     const mape = a > 0 ? round4(absErr / a) : null;
-    sumActual += a;
-    sumAbsErr += absErr;
+    sumActual += a; sumAbsErr += absErr;
 
     const oldCoeff = await getCoeff(s);
     let newCoeff = oldCoeff;
-
-    // 변동비만 계수로 보정. e.variable 은 이미 oldCoeff 가 곱해진 값이므로
-    //   단가×사용량 = e.variable / oldCoeff,  목표계수 = 실제변동비 / (단가×사용량)
     const actualVar = a - e.fixed;
     if (e.variable > 0 && actualVar > 0 && oldCoeff > 0) {
       const desired = (actualVar * oldCoeff) / e.variable;
       newCoeff = clamp(oldCoeff * (1 - LEARNING_RATE) + desired * LEARNING_RATE, COEFF_MIN, COEFF_MAX);
       await putCoeff(s, newCoeff, iso);
     }
-
     const row = {
-      pk: `ACC#${day}`,
-      sk: s,
-      type: "accuracy",
-      service: s,
-      day,
-      actual: round4(a),
-      estimated: round4(estimatedTotal),
-      fixed: round4(e.fixed),
-      mape,
-      ratio: estimatedTotal > 0 ? round4(a / estimatedTotal) : null,
-      oldCoeff: round4(oldCoeff),
-      newCoeff: round4(newCoeff),
-      updatedAt: iso,
+      pk: accPk, sk: s, type: "accuracy", service: s, window: label,
+      actual: round4(a), estimated: round4(estimatedTotal), fixed: round4(e.fixed),
+      mape, ratio: estimatedTotal > 0 ? round4(a / estimatedTotal) : null,
+      oldCoeff: round4(oldCoeff), newCoeff: round4(newCoeff), updatedAt: iso,
     };
     await ddb.send(new PutItemCommand({ TableName: DDB_TABLE, Item: marshall(row, { removeUndefinedValues: true }) }));
     report.push(row);
   }
 
-  // 전체 정확도 요약 (WAPE = Σ|오차| / Σ실제)
   const overallWape = sumActual > 0 ? round4(sumAbsErr / sumActual) : null;
-  await ddb.send(
-    new PutItemCommand({
-      TableName: DDB_TABLE,
-      Item: marshall(
-        { pk: `ACC#${day}`, sk: "__overall", type: "accuracy", day, sumActual: round4(sumActual), wape: overallWape, updatedAt: iso },
-        { removeUndefinedValues: true }
-      ),
-    })
-  );
+  await ddb.send(new PutItemCommand({
+    TableName: DDB_TABLE,
+    Item: marshall({ pk: accPk, sk: "__overall", type: "accuracy", window: label, sumActual: round4(sumActual), wape: overallWape, hoursSeen, updatedAt: iso }, { removeUndefinedValues: true }),
+  }));
 
-  console.log(`[reconciler] ${day} 보정 완료: WAPE=${overallWape}`, report.map((r) => ({ s: r.service, mape: r.mape, coeff: r.newCoeff })));
-  return { statusCode: 200, body: JSON.stringify({ day, wape: overallWape, services: report }) };
+  console.log(`[reconciler] ${label} 보정완료: WAPE=${overallWape}, 시간수=${hoursSeen}`,
+    report.map((r) => ({ s: r.service, actual: r.actual, est: r.estimated, mape: r.mape, coeff: r.newCoeff })));
+  return { statusCode: 200, body: JSON.stringify({ window: label, wape: overallWape, hoursSeen, services: report }) };
 };
