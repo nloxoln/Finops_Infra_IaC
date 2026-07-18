@@ -34,8 +34,8 @@ const CUR_REPORT = process.env.CUR_REPORT || "cost-poc-cur";
 // ---- 보정 파라미터 ----
 const LEARNING_RATE = Number(process.env.LEARNING_RATE || 0.3);
 const RECONCILE_LAG_DAYS = Number(process.env.RECONCILE_LAG_DAYS || 2);
-const COEFF_MIN = 0.2;
-const COEFF_MAX = 5;
+const COEFF_MIN = Number(process.env.COEFF_MIN || 0.1);
+const COEFF_MAX = Number(process.env.COEFF_MAX || 20);
 const KST_OFFSET_H = 9; // KST = UTC + 9
 
 const FINOPS_MARKERS = (process.env.FINOPS_MARKERS ||
@@ -266,9 +266,12 @@ export const handler = async (event) => {
 
     const oldCoeff = await getCoeff(s);
     let newCoeff = oldCoeff;
-    const actualVar = a - e.fixed;
-    if (e.variable > 0 && actualVar > 0 && oldCoeff > 0) {
-      const desired = (actualVar * oldCoeff) / e.variable;
+    // 통합 coeff 모델: base(=고정비+변동비, pre-coeff)에 coeff 를 곱해 서비스 전체를 스케일.
+    // estimator 가 variable 을 pre-coeff(raw)로 저장하므로 e.fixed+e.variable 이 곧 base.
+    // → 고정비만 있는 서비스(rds/route53 등)도 base>0 이면 갱신되어 실제값에 수렴한다.
+    const base = e.fixed + e.variable;
+    if (base > 0 && a > 0 && oldCoeff > 0) {
+      const desired = a / base; // 이 창을 정확히 맞추는 coeff
       newCoeff = clamp(oldCoeff * (1 - LEARNING_RATE) + desired * LEARNING_RATE, COEFF_MIN, COEFF_MAX);
       await putCoeff(s, newCoeff, iso);
     }
@@ -292,3 +295,16 @@ export const handler = async (event) => {
     report.map((r) => ({ s: r.service, actual: r.actual, est: r.estimated, mape: r.mape, coeff: r.newCoeff })));
   return { statusCode: 200, body: JSON.stringify({ window: label, wape: overallWape, hoursSeen, services: report }) };
 };
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -15,6 +15,7 @@ import { CloudWatchClient, GetMetricDataCommand } from "@aws-sdk/client-cloudwat
 import { ElasticLoadBalancingV2Client, DescribeLoadBalancersCommand } from "@aws-sdk/client-elastic-load-balancing-v2";
 import { CloudFrontClient, ListDistributionsCommand } from "@aws-sdk/client-cloudfront";
 import { EC2Client, DescribeNatGatewaysCommand, DescribeInstancesCommand } from "@aws-sdk/client-ec2";
+import { Route53Client, ListHostedZonesCommand } from "@aws-sdk/client-route-53";
 import { DynamoDBClient, PutItemCommand, GetItemCommand, QueryCommand } from "@aws-sdk/client-dynamodb";
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
 
@@ -26,12 +27,14 @@ const cwGlobal = new CloudWatchClient({ region: "us-east-1" });
 const elb = new ElasticLoadBalancingV2Client({ region: REGION });
 const cf = new CloudFrontClient({ region: "us-east-1" }); // CloudFront 는 글로벌 엔드포인트
 const ec2 = new EC2Client({ region: REGION });
+const r53 = new Route53Client({ region: "us-east-1" }); // Route53 은 글로벌 엔드포인트
 const ddb = new DynamoDBClient({ region: REGION });
 
 const DDB_TABLE = process.env.DDB_TABLE;
 const ALB_NAME = process.env.ALB_NAME || "app-alb";
 const RDS_ID = process.env.RDS_ID || "cj-olive0";
 const CF_ALIAS = process.env.CF_ALIAS || "sharpynloxoln.store";
+const R53_DOMAIN = process.env.R53_DOMAIN || "sharpynloxoln.store."; // 퍼블릭 호스팅 존 이름(끝점 포함)
 const EC2_TAG_NAME = process.env.EC2_TAG_NAME || "ec2-app";
 const IMAGES_BUCKET = process.env.IMAGES_BUCKET || "olive-product";
 const STATIC_BUCKET = process.env.STATIC_BUCKET || "front-caching";
@@ -63,6 +66,7 @@ const PRICES = {
   cf_gb: 0.114, // CloudFront 아웃바운드 GB당
   s3_get_1k: 0.0004, // S3 GET 1천건당
   r53_zone_month: 0.5, // Route53 호스팅 존 월정액
+  r53_query_1m: 0.4, // Route53 표준 쿼리 100만건당 (첫 10억건 구간)
 };
 
 const HOURS_PER_MONTH = 730;
@@ -90,7 +94,7 @@ function fixedCosts() {
 // 실패해도 해당 신호만 0 이 되고 나머지는 정상 동작하도록 best-effort.
 // ---------------------------------------------------------------------
 async function discover() {
-  const out = { albSuffix: null, cfId: null, natIds: [], ec2Ids: [] };
+  const out = { albSuffix: null, cfId: null, natIds: [], ec2Ids: [], r53ZoneId: null };
 
   try {
     const r = await elb.send(new DescribeLoadBalancersCommand({ Names: [ALB_NAME] }));
@@ -133,6 +137,17 @@ async function discover() {
     );
   } catch (e) {
     console.warn("EC2 디스커버리 실패:", e.message);
+  }
+
+  try {
+    const r = await r53.send(new ListHostedZonesCommand({}));
+    const zone = (r.HostedZones || []).find(
+      (z) => !z.Config?.PrivateZone && z.Name === R53_DOMAIN
+    );
+    // HostedZone.Id 는 "/hostedzone/ZXXXX" 형태 → CloudWatch dimension 은 접두사 없는 ZXXXX
+    if (zone?.Id) out.r53ZoneId = zone.Id.replace("/hostedzone/", "");
+  } catch (e) {
+    console.warn("Route53 디스커버리 실패:", e.message);
   }
 
   return out;
@@ -179,6 +194,10 @@ async function collectUsage(d, start, end) {
   if (d.cfId) {
     addQ(globalQ, "AWS/CloudFront", "Requests", [{ Name: "DistributionId", Value: d.cfId }, { Name: "Region", Value: "Global" }], "Sum", "cfReq");
     addQ(globalQ, "AWS/CloudFront", "BytesDownloaded", [{ Name: "DistributionId", Value: d.cfId }, { Name: "Region", Value: "Global" }], "Sum", "cfBytes");
+  }
+  // Route53 — DNS 쿼리 수 (변동, route53). 지표는 us-east-1 전용 → globalQ
+  if (d.r53ZoneId) {
+    addQ(globalQ, "AWS/Route53", "DNSQueries", [{ Name: "HostedZoneId", Value: d.r53ZoneId }], "Sum", "r53Queries");
   }
 
   const usage = {};
@@ -444,7 +463,7 @@ export const handler = async (event = {}) => {
     cloudfront: ((usage.cfReq || 0) / 10000) * PRICES.cf_req_10k + ((usage.cfBytes || 0) / 1e9) * PRICES.cf_gb,
     s3: ((usage.s3Get || 0) / 1000) * PRICES.s3_get_1k,
     rds: 0, // gp2 는 I/O 별도 과금 없음 → 변동비 0 (사용량은 스냅샷에만 기록)
-    route53: 0,
+    route53: ((usage.r53Queries || 0) / 1e6) * PRICES.r53_query_1m, // DNS 쿼리 100만건당 과금
   };
 
   const dayUTC = start.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -454,8 +473,10 @@ export const handler = async (event = {}) => {
   let total = 0;
   const perService = {};
   for (const s of SERVICES) {
-    const varCost = (variableRaw[s] || 0) * (coeff[s] || 1);
-    const est = round4((fixed[s] || 0) + varCost);
+    // 통합 coeff 모델: 보정계수를 (고정비+변동비) 전체에 곱해 서비스 전체를 스케일한다.
+    // → 고정비만 있는 서비스(rds/route53 등)도 coeff 로 오차를 흡수·수렴할 수 있다.
+    const baseRaw = (fixed[s] || 0) + (variableRaw[s] || 0); // pre-coeff 합
+    const est = round4(baseRaw * (coeff[s] || 1));
     perService[s] = est;
     total += est;
 
@@ -470,9 +491,9 @@ export const handler = async (event = {}) => {
             service: s,
             hourUTC: hourKey,
             fixed: round4(fixed[s] || 0),
-            variable: round4(varCost),
+            variable: round4(variableRaw[s] || 0), // pre-coeff 변동비(raw) — reconciler 가 base 복원에 사용
             coeff: round4(coeff[s] || 1),
-            estimated: est,
+            estimated: est, // = (fixed + variable) * coeff
             ttl,
           },
           { removeUndefinedValues: true }
@@ -500,8 +521,9 @@ export const handler = async (event = {}) => {
           rdsWriteIops: round4(usage.rdsWriteIops || 0),
           rdsReadIops: round4(usage.rdsReadIops || 0),
           rdsCpu: round4(usage.rdsCpu || 0),
+          r53Queries: Math.round(usage.r53Queries || 0),
           estimatedTotal: round4(total),
-          discovered: { albSuffix: d.albSuffix, cfId: d.cfId, natCount: d.natIds.length, ec2Count: d.ec2Ids.length },
+          discovered: { albSuffix: d.albSuffix, cfId: d.cfId, natCount: d.natIds.length, ec2Count: d.ec2Ids.length, r53ZoneId: d.r53ZoneId },
           ttl,
         },
         { removeUndefinedValues: true }

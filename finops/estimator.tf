@@ -79,7 +79,8 @@ resource "aws_iam_role_policy" "estimator_permissions" {
         "elasticloadbalancing:DescribeLoadBalancers",
         "cloudfront:ListDistributions",
         "ec2:DescribeNatGateways",
-        "ec2:DescribeInstances"
+        "ec2:DescribeInstances",
+        "route53:ListHostedZones"
       ], Resource = "*" },
       # DynamoDB 쓰기/계수 읽기
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem"], Resource = aws_dynamodb_table.cost_estimates.arn }
@@ -104,6 +105,7 @@ resource "aws_lambda_function" "estimator" {
       ALB_NAME      = "app-alb"
       RDS_ID        = "cj-olive0"
       CF_ALIAS      = "sharpynloxoln.store"
+      R53_DOMAIN    = "sharpynloxoln.store." # Route53 퍼블릭 호스팅 존 이름(끝점 포함)
       EC2_TAG_NAME  = "ec2-app"
       IMAGES_BUCKET = "olive-product"
       STATIC_BUCKET = "front-caching"
@@ -153,9 +155,9 @@ resource "aws_iam_role_policy" "reconciler_permissions" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = ["s3:GetObject", "s3:ListBucket"],
-        Resource = ["arn:aws:s3:::oliveyoung-costpoc-cur", "arn:aws:s3:::oliveyoung-costpoc-cur/*"] },
+      Resource = ["arn:aws:s3:::oliveyoung-costpoc-cur", "arn:aws:s3:::oliveyoung-costpoc-cur/*"] },
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"],
-        Resource = aws_dynamodb_table.cost_estimates.arn }
+      Resource = aws_dynamodb_table.cost_estimates.arn }
     ]
   })
 }
@@ -172,13 +174,13 @@ resource "aws_lambda_function" "reconciler" {
 
   environment {
     variables = {
-      DDB_TABLE     = aws_dynamodb_table.cost_estimates.name
-      REGION        = local.finops_region
-      LEARNING_RATE = "0.3"
+      DDB_TABLE          = aws_dynamodb_table.cost_estimates.name
+      REGION             = local.finops_region
+      LEARNING_RATE      = "0.3"
       RECONCILE_LAG_DAYS = "2"
-      CUR_BUCKET = "oliveyoung-costpoc-cur"
-      CUR_PREFIX = "cur"
-      CUR_REPORT = "cost-poc-cur"
+      CUR_BUCKET         = "oliveyoung-costpoc-cur"
+      CUR_PREFIX         = "cur"
+      CUR_REPORT         = "cost-poc-cur"
     }
   }
 
