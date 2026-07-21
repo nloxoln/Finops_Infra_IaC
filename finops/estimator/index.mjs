@@ -55,18 +55,18 @@ const ALERT_TTL_DAYS = Number(process.env.ALERT_TTL_DAYS || 30);
 // ---------------------------------------------------------------------
 const PRICES = {
   ec2_t3small_hr: 0.026, // t3.small 온디맨드 시간당
-  ec2_surplus_vcpu_hr: 0.05, // T3 unlimited 초과 크레딧 (vCPU-hour 근사)
-  rds_t3small_hr: 0.036, // db.t3.small 단일 AZ (Multi-AZ 는 ×2)
-  rds_storage_gb_month: 0.131, // gp2 GB-월
-  nat_hr: 0.059, // NAT Gateway 시간당(게이트웨이당)
+  ec2_surplus_vcpu_hr: 0.05, // t3 unlimited 초과 크레딧 (vCPU-hour 근사)
+  rds_t3small_hr: 0.036, // db.t3.small (Multi-AZ, 1개 대기)
+  rds_storage_gb_month: 0.131, // gp2 GB당 월 고정
+  nat_hr: 0.059, // NAT Gateway 시간당
   nat_gb: 0.059, // NAT 처리 GB당
   alb_hr: 0.0225, // ALB 시간당 고정
-  alb_lcu_hr: 0.008, // LCU-시간당
+  alb_lcu_hr: 0.008, // LCU 시간당
   cf_req_10k: 0.012, // CloudFront HTTPS 요청 1만건당
   cf_gb: 0.114, // CloudFront 아웃바운드 GB당
   s3_get_1k: 0.0004, // S3 GET 1천건당
-  r53_zone_month: 0.5, // Route53 호스팅 존 월정액
-  r53_query_1m: 0.4, // Route53 표준 쿼리 100만건당 (첫 10억건 구간)
+  r53_zone_month: 0.5, // Route53 호스팅존 월정액
+  r53_query_1m: 0.4, // Route53 표준 쿼리 100만건당
 };
 
 const HOURS_PER_MONTH = 730;
@@ -250,12 +250,40 @@ function stats(samples) {
   return { n, mean, std: Math.sqrt(variance) };
 }
 
-// 같은 "시간대(hour-of-day)" 기준으로 과거 며칠치 서비스별 추정치를 수집
-// → 계절성(점심/퇴근 피크, 화~토 패턴)을 그대로 반영. 없으면 최근 시간들로 폴백.
+// 같은 "시간대(hour-of-day)" 기준으로 과거 며칠치 서비스별 값을 수집
+// → 계절성(점심/퇴근 피크) 반영. 없으면 최근 시간들로 폴백(trailingBaseline).
+//
+// [하이브리드 baseline] 각 과거 날짜마다:
+//   1순위) ACTUAL#{날짜} — CUR 기반 시간별 실제비용 (reconciler 가 저장, ≈T-2 이상)
+//   2순위) EST#{날짜}    — 실제값이 아직 없는 최근 날짜(어제/오늘)는 추정치로 폴백
+// → "나온 건 실제값, 아직 안 나온 건 추정치"로 baseline 정확도를 높인다.
 async function buildBaseline(dayUTC, HH) {
   const seasonal = {}; // service -> number[]
   for (let d = 1; d <= BASELINE_DAYS; d++) {
     const dp = prevDay(dayUTC, d);
+
+    // 1순위: 실제값(ACTUAL#) 조회
+    let usedActual = false;
+    try {
+      const ra = await ddb.send(
+        new QueryCommand({
+          TableName: DDB_TABLE,
+          KeyConditionExpression: "pk = :pk AND begins_with(sk, :h)",
+          ExpressionAttributeValues: marshall({ ":pk": `ACTUAL#${dp}`, ":h": `${dp}T${HH}` }),
+        })
+      );
+      for (const raw of ra.Items || []) {
+        const it = unmarshall(raw);
+        if (it.type !== "actual") continue;
+        (seasonal[it.service] ||= []).push(it.actual);
+        usedActual = true;
+      }
+    } catch (e) {
+      /* 실제값 없음 — 추정치로 폴백 */
+    }
+    if (usedActual) continue; // 그 날짜는 실제값으로 채웠으니 추정치 건너뜀
+
+    // 2순위: 추정치(EST#) 폴백
     try {
       const r = await ddb.send(
         new QueryCommand({
@@ -300,24 +328,136 @@ async function trailingBaseline(dayUTC, currentHourKey) {
   return byService;
 }
 
-// 서비스별 추정 원인 힌트 (시나리오 지식 기반)
-function causeHint(service) {
-  switch (service) {
-    case "cloudfront":
-      return "CloudFront 요청/전송량 급증 — 캐시 미스율 상승(롱테일/스크래핑) 의심";
-    case "elb":
-      return "ALB LCU 급증 — 트래픽/신규 커넥션 폭증 의심";
-    case "ec2":
-      return "EC2 초과 CPU 크레딧 과금 — 인스턴스 부하 급증(EC2_LOAD 유형) 의심";
-    case "ec2-other":
-      return "NAT 아웃바운드 전송량 급증 — 외부 다운로드/유출 의심";
-    case "s3":
-      return "S3 GET 요청 급증 의심";
-    case "rds":
-      return "RDS I/O·CPU 급증 — 쓰기 폭주(RDS_WRITE 유형) 의심";
-    default:
-      return "평소 대비 비용 급증";
+// =====================================================================
+// 이상 원인 규칙 카탈로그 (rule catalog)
+// ---------------------------------------------------------------------
+// 설계 의도:
+//   - 데이터가 적은 PoC 단계라 원인 판정은 "규칙 기반"이 안전하다(LLM 미사용).
+//   - 규칙은 풍부하게(카탈로그로) 정의해두고, 실제로는 조건(match)을 충족한
+//     규칙만 발화한다. 현재 주입 시나리오(CACHE_MISS/EC2_LOAD/SALE/RDS_WRITE)는
+//     아래 규칙 중 일부에만 매칭되며, 나머지 규칙(DATA_EXFIL 등)은 카탈로그에
+//     존재하되 해당 신호가 없으면 조용하다.
+//   - 각 규칙은 심각도 가중(sevBoost)·원인·해결방안·콘솔 확인 경로를 담아
+//     알람과 종합보고서 텍스트를 함께 생성한다.
+//
+// ctx: { service, z, severity, current, expected, usage, perService }
+//   - usage: 이번 시간 사용량 스냅샷(albLcu/natBytes/cfReq/rdsWriteIops 등)
+//   - perService: 이번 시간 서비스별 추정치(교차 서비스 조건에 사용)
+// =====================================================================
+const RULE_CATALOG = [
+  {
+    id: "CACHE_MISS_SPAM",
+    title: "CloudFront 캐시 미스 급증",
+    resourceType: "CloudFront",
+    match: (c) => c.service === "cloudfront",
+    cause:
+      "CloudFront 요청·전송량 급증. 인기상품 외 롱테일 이미지 요청이 몰려 캐시 미스율이 올라가면 오리진(ALB/S3) 조회와 데이터 전송 비용이 함께 증가한다. 스크래핑/봇 트래픽 가능성.",
+    action:
+      "① 캐시 정책(TTL) 상향 및 이미지 경로 캐싱 확인 ② WAF Rate-based rule로 비정상 요청 차단 ③ 인기상품 캐시 워밍 ④ Referer/UA 기반 스크래핑 필터",
+    console:
+      "CloudFront 콘솔 → 대상 배포 → Reports & analytics → Cache statistics(미스율) / Popular objects. CloudWatch(us-east-1) → CloudFront → Requests·BytesDownloaded",
+  },
+  {
+    id: "EC2_LOAD_SPAM",
+    title: "EC2 부하 급증(초과 크레딧 과금)",
+    resourceType: "EC2",
+    match: (c) => c.service === "ec2",
+    cause:
+      "T3 인스턴스의 CPU 크레딧이 소진되어 초과(surplus) 크레딧 과금이 발생. 전체 요청량 급증으로 애플리케이션 CPU 사용이 지속적으로 높은 상태.",
+    action:
+      "① Auto Scaling으로 인스턴스 수평 확장 ② 지속 고부하면 t3→c계열/상위 타입 전환 ③ T3 Unlimited 비용 검토 ④ 비정상 트래픽이면 ALB/WAF에서 차단",
+    console:
+      "CloudWatch → EC2 → CPUUtilization / CPUSurplusCreditsCharged. EC2 콘솔 → 인스턴스 → 모니터링 탭",
+  },
+  {
+    id: "ALB_TRAFFIC_SPAM",
+    title: "ALB 트래픽/커넥션 급증(LCU)",
+    resourceType: "ALB",
+    match: (c) => c.service === "elb",
+    cause:
+      "ALB의 LCU(신규 커넥션·활성 커넥션·처리 바이트·룰 평가) 급증. 전반적 요청 폭증 또는 커넥션 스파이크.",
+    action:
+      "① 백엔드 스케일아웃으로 커넥션 분산 ② keep-alive/커넥션 재사용 점검 ③ 비정상 소스면 WAF 차단 ④ 헬스체크·타깃 상태 확인",
+    console:
+      "CloudWatch → ApplicationELB → ConsumedLCUs·ActiveConnectionCount·RequestCount. EC2 콘솔 → 로드밸런서 → 모니터링",
+  },
+  {
+    id: "SALE_EVENT",
+    title: "다중 서비스 동시 비용 급증(세일/캠페인성)",
+    resourceType: "Multiple",
+    // 교차 서비스 조건: 이번 시간에 임계 초과한 서비스가 3개 이상이면 세일성으로 판정
+    match: (c) =>
+      Object.values(c.perService || {}).filter((v) => v > 0).length >= 3 &&
+      c._anomalyCount >= 3,
+    cause:
+      "여러 서비스(CloudFront·ALB·EC2 등)가 동시에 상승. 특정 리소스 결함보다는 세일/마케팅 캠페인 같은 전사적 트래픽 급증 패턴.",
+    action:
+      "① 계획된 이벤트인지 먼저 확인(오탐 방지) ② 사전 스케줄 스케일링 적용 ③ 예산 알람·상한 점검 ④ 이벤트 종료 후 리소스 원복 확인",
+    console:
+      "FinOps 대시보드 → 비용 추이(전 서비스 동시 상승 여부). Cost Explorer → 서비스별 일별 그래프",
+  },
+  {
+    id: "RDS_WRITE_SPAM",
+    title: "RDS 쓰기 I/O 급증",
+    resourceType: "RDS",
+    match: (c) => c.service === "rds",
+    cause:
+      "RDS WriteIOPS·CPU 급증. 주문/쓰기 트랜잭션 폭주. (gp2 스토리지는 I/O 별도 과금이 없어 비용 기여는 작지만, 부하·장애 전조로 중요한 신호.)",
+    action:
+      "① 쓰기 쿼리/배치 점검 ② 커넥션 풀·슬로우 쿼리 확인 ③ 읽기는 리드 리플리카로 분산 ④ 지속되면 인스턴스 등급/스토리지 타입(gp3·io1) 재검토",
+    console:
+      "CloudWatch → RDS → WriteIOPS·ReadIOPS·CPUUtilization. RDS 콘솔 → 대상 DB → 모니터링 / Performance Insights",
+  },
+  // ---- 아래는 카탈로그 확장분(현재 주입 시나리오엔 없음, 신호 연결은 future work) ----
+  {
+    id: "DATA_EXFIL",
+    title: "NAT 아웃바운드 전송 급증(데이터 유출 의심)",
+    resourceType: "NAT",
+    match: (c) => c.service === "ec2-other",
+    cause:
+      "NAT Gateway 아웃바운드 전송량 급증. 대량 외부 다운로드·업로드, 데이터 유출 또는 오설정된 배치 전송 가능성.",
+    action:
+      "① VPC Flow Logs로 목적지 IP·포트 확인 ② 비정상 목적지면 SG/NACL 차단 ③ S3 전송은 VPC Endpoint로 우회해 NAT 비용 제거 ④ 침해 의심 시 보안팀 에스컬레이션",
+    console:
+      "CloudWatch → NATGateway → BytesOutToDestination. VPC 콘솔 → Flow Logs. CloudTrail → 관련 이벤트",
+  },
+  {
+    id: "S3_GET_SPAM",
+    title: "S3 GET 요청 급증",
+    resourceType: "S3",
+    match: (c) => c.service === "s3",
+    cause:
+      "S3 GET 요청 급증. CloudFront 우회 직접 접근 또는 캐시 미적용 경로로 인한 요청 폭증 가능성.",
+    action:
+      "① CloudFront 경유로 캐싱 유도 ② 버킷 정책으로 직접 접근 제한 ③ 요청자 지불(Requester Pays) 검토",
+    console:
+      "CloudWatch → S3 → NumberOfObjects/Requests(요청 지표 활성화 시). S3 콘솔 → 버킷 → 지표",
+  },
+];
+
+// ctx로 카탈로그를 평가해 매칭된 첫 규칙을 반환(없으면 서비스 기반 기본 규칙)
+function matchRule(ctx) {
+  for (const rule of RULE_CATALOG) {
+    try {
+      if (rule.match(ctx)) return rule;
+    } catch {
+      /* 규칙 평가 실패는 무시하고 다음 규칙 */
+    }
   }
+  return {
+    id: "GENERIC",
+    title: `${ctx.service} 비용 급증`,
+    resourceType: ctx.service,
+    cause: "평소 대비 비용이 통계적으로 유의하게 상승. 상세 원인 규칙 미매칭.",
+    action: "해당 서비스의 CloudWatch 지표와 최근 배포/트래픽 변화를 점검.",
+    console: "CloudWatch → 해당 서비스 네임스페이스에서 관련 지표 확인",
+  };
+}
+
+// 하위호환: 기존 호출부가 쓰던 문자열 원인 힌트
+function causeHint(service) {
+  const rule = matchRule({ service, perService: {}, _anomalyCount: 1 });
+  return rule.cause;
 }
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -345,65 +485,138 @@ async function notifySlack(payload) {
   }
 }
 
+// 종합보고서(프론트 '종합보고서' 칸)에 그대로 실릴 서술형 텍스트 생성
+function buildReportText({ company, service, rule, severity, z, mean, current, mode, n, hourKey, usage }) {
+  const sevLabel = severity === "CRITICAL" ? "심각(CRITICAL)" : "경고(WARNING)";
+  const pct = mean > 0 ? Math.round(((current - mean) / mean) * 100) : null;
+  const lines = [
+    `[${company} 비용 이상탐지 보고서] ${rule.title}`,
+    ``,
+    `■ 심각도: ${sevLabel} (z=${round2(z)}σ)`,
+    `■ 대상 서비스: ${service} (${rule.resourceType})`,
+    `■ 대상 시각(UTC): ${hourKey}`,
+    `■ 비용 변화: 평소 추정 $${round2(mean)} → 이번 추정 $${round2(current)}` +
+      (pct != null ? ` (약 ${pct >= 0 ? "+" : ""}${pct}%)` : ""),
+    `■ 판정 근거: baseline(${mode === "seasonal" ? "동일 시간대 과거" : "최근 시간대 폴백"}, 표본 ${n}개)의 ` +
+      `평균·표준편차 대비 ${round2(z)}σ 초과. 정규분포 가정상 ` +
+      `${severity === "CRITICAL" ? "상위 0.003%" : "상위 2.3%"} 수준의 이례적 상승.`,
+    ``,
+    `■ 추정 원인`,
+    `  ${rule.cause}`,
+    ``,
+    `■ 권장 조치`,
+    `  ${rule.action}`,
+    ``,
+    `■ 콘솔 확인 경로`,
+    `  ${rule.console}`,
+    ``,
+    `※ 본 판정은 CUR(실제청구) 도착 전 CloudWatch 지표 기반 실시간 추정치로 산출됨. ` +
+      `익일 CUR 도착 시 reconciler가 실제값과 대조해 정확도(MAPE/WAPE)를 검증하고 보정계수를 갱신함.`,
+  ];
+  return lines.join("\n");
+}
+
 // 현재 시각 서비스별 추정치를 baseline 과 비교해 이상 탐지 → ALERT 기록 + 슬랙
+// (규칙 카탈로그로 원인/조치/콘솔경로/보고서 텍스트를 함께 생성)
 async function detectAndAlert(perService, dayUTC, hourKey, usage, endEpochSec) {
   const HH = hourKey.slice(11, 13);
   const seasonal = await buildBaseline(dayUTC, HH);
   let trailing = null; // 필요 시 지연 로딩
 
   const ttl = endEpochSec + ALERT_TTL_DAYS * 86400;
-  const alerts = [];
 
+  // ── 1단계: 서비스별 z 계산 → 임계 초과분만 후보로 수집 ──
+  //   (SALE_EVENT 등 "동시 다발" 교차 규칙 판정을 위해 먼저 전수 계산)
+  const candidates = [];
   for (const [service, current] of Object.entries(perService)) {
-    // 1) 계절성 baseline 우선
     let samples = seasonal[service] || [];
     let mode = "seasonal";
-    // 2) 표본 부족하면 최근시간 폴백 (cold start 데모 대응)
     if (samples.length < MIN_SAMPLES) {
       if (!trailing) trailing = await trailingBaseline(dayUTC, hourKey);
       samples = trailing[service] || [];
       mode = "trailing";
     }
-    if (samples.length < MIN_SAMPLES) continue; // 아직 판단 불가
+    if (samples.length < MIN_SAMPLES) continue; // 판단 불가
 
     const { n, mean, std } = stats(samples);
-    if (std <= 0) continue; // 분산 0 (고정비만) → 스킵
+    if (std <= 0) continue; // 분산 0(고정비만) → 스킵
     const z = (current - mean) / std;
     const severity = severityOf(z);
     if (!severity) continue;
 
+    candidates.push({ service, current, mean, std, z, severity, mode, n });
+  }
+
+  const anomalyCount = candidates.length; // 이번 시각 임계 초과 서비스 수(교차 규칙용)
+  const nowIso = new Date().toISOString();
+  const alerts = [];
+
+  // ── 2단계: 후보마다 규칙 매칭 → ALERT 저장 + 슬랙 ──
+  for (const c of candidates) {
+    const rule = matchRule({
+      service: c.service,
+      z: c.z,
+      severity: c.severity,
+      current: c.current,
+      expected: c.mean,
+      usage,
+      perService,
+      _anomalyCount: anomalyCount,
+    });
+
+    const rawData = `${c.service} 시간당 추정 $${round2(c.current)} (baseline 평균 $${round2(c.mean)}, ${c.mode}, n=${c.n}, ${round2(c.z)}σ)`;
+    const summary = `${rule.title} — ${c.service} 추정비용이 평소 대비 ${round2(c.z)}σ 상승`;
+    const reportText = buildReportText({
+      company: COMPANY_NAME, service: c.service, rule, severity: c.severity,
+      z: c.z, mean: c.mean, current: c.current, mode: c.mode, n: c.n, hourKey, usage,
+    });
+
     const alert = {
-      service,
-      severity,
-      z: round2(z),
-      expected: round2(mean),
-      actual: round2(current),
-      baselineMode: mode,
-      baselineN: n,
-      cause: causeHint(service),
+      service: c.service,
+      ruleId: rule.id,
+      title: rule.title,
+      resourceType: rule.resourceType,
+      severity: c.severity,
+      z: round2(c.z),
+      expected: round2(c.mean),
+      actual: round2(c.current),
+      baselineMode: c.mode,
+      baselineN: c.n,
+      cause: rule.cause,
+      action: rule.action,
+      console: rule.console,
     };
     alerts.push(alert);
 
-    // ALERT 기록 (status=OPEN, 담당자 확인 전까지 유지 — ack 는 별도 API 에서)
+    // ALERT 기록 (status=OPEN). 프론트 '이상 탐지 내역' + '종합보고서'가 읽는 필드 포함.
     await ddb.send(
       new PutItemCommand({
         TableName: DDB_TABLE,
         Item: marshall(
           {
             pk: "ALERT",
-            sk: `${hourKey}#${service}`,
+            sk: `${hourKey}#${c.service}`,
             type: "alert",
             status: "OPEN",
             company: COMPANY_NAME,
-            service,
-            severity,
-            z: round2(z),
-            expected: round2(mean),
-            actual: round2(current),
-            detectedAt: new Date().toISOString(),
+            service: c.service,
+            ruleId: rule.id,
+            title: rule.title,          // 프론트 Anomaly.title
+            resourceType: rule.resourceType, // 프론트 Anomaly.resourceType
+            severity: c.severity,
+            z: round2(c.z),
+            expected: round2(c.mean),
+            actual: round2(c.current),
+            detectedAt: nowIso,
+            date: hourKey.slice(0, 10),  // 프론트 Anomaly.date (YYYY-MM-DD)
             hourUTC: hourKey,
-            summary: `${service} 추정비용 $${round2(current)} (평소 $${round2(mean)}, ${round2(z)}σ)`,
-            cause: causeHint(service),
+            rawData,                     // 프론트 Anomaly.rawData
+            summary,                     // 프론트 Anomaly.summary
+            cause: rule.cause,           // 프론트 Anomaly.cause
+            action: rule.action,         // 권장 조치
+            consolePath: rule.console,   // 콘솔 확인 경로
+            actionRequired: c.severity === "CRITICAL", // 프론트 Anomaly.actionRequired
+            reportText,                  // 종합보고서 칸 서술형 텍스트
             ttl,
           },
           { removeUndefinedValues: true }
@@ -411,22 +624,22 @@ async function detectAndAlert(perService, dayUTC, hourKey, usage, endEpochSec) {
       })
     );
 
-    // 슬랙 전송 (심각도 포함)
+    // 슬랙 전송 (심각도·원인·조치·콘솔경로 포함)
     await notifySlack({
       company: COMPANY_NAME,
-      severity,
-      service,
-      rawData: `${service} 시간당 추정 $${round2(current)} (baseline 평균 $${round2(mean)}, ${mode}, n=${n})`,
-      summary: `${service} 추정비용이 평소 대비 ${round2(z)}σ 상승`,
-      cause: causeHint(service),
-      actionRequired: severity === "CRITICAL",
-      metric: { expected: round2(mean), actual: round2(current), z: round2(z), sigma: round2(z) },
-      detectedAt: new Date().toISOString(),
+      severity: c.severity,
+      service: c.service,
+      rawData,
+      summary,
+      cause: `${rule.cause}\n\n▶ 권장 조치: ${rule.action}\n▶ 콘솔 확인: ${rule.console}`,
+      actionRequired: c.severity === "CRITICAL",
+      metric: { expected: round2(c.mean), actual: round2(c.current), z: round2(c.z), sigma: round2(c.z) },
+      detectedAt: nowIso,
       hourUTC: hourKey,
     });
   }
 
-  if (alerts.length) console.log(`[estimator] 이상 탐지 ${alerts.length}건`, alerts);
+  if (alerts.length) console.log(`[estimator] 이상 탐지 ${alerts.length}건`, alerts.map((a) => `${a.service}:${a.ruleId}(${a.severity},${a.z}σ)`));
   return alerts;
 }
 

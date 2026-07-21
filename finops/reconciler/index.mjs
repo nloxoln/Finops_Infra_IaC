@@ -246,6 +246,38 @@ export const handler = async (event) => {
   }
   const hoursSeen = Object.keys(actualHour).length;
 
+  // ── 1-b) 시간별 실제비용(ACTUAL#) 저장 ──
+  //   CUR 을 시간·서비스 단위로 파싱한 actualHour 를 그대로 DynamoDB 에 남긴다.
+  //   구조는 EST# 와 대칭: pk="ACTUAL#{날짜}", sk="{시간}#{서비스}".
+  //   → estimator 의 baseline 이 추정치(EST#) 대신 실제값(ACTUAL#)을 쓸 수 있게 됨.
+  //   EST# 와 동일하게 TTL 로 자동 폐기(저장 최소화 원칙 유지).
+  const ACTUAL_TTL_DAYS = Number(process.env.ACTUAL_TTL_DAYS || 90);
+  let actualRowsWritten = 0;
+  for (const [hour, svcMap] of Object.entries(actualHour)) {
+    // hour = "YYYY-MM-DDTHH"
+    const hourDay = hour.slice(0, 10);
+    const hourEpoch = Math.floor(new Date(`${hour}:00:00Z`).getTime() / 1000);
+    const rowTtl = hourEpoch + ACTUAL_TTL_DAYS * 86400;
+    for (const [svc, cost] of Object.entries(svcMap)) {
+      if (svc === "others") continue;
+      await ddb.send(new PutItemCommand({
+        TableName: DDB_TABLE,
+        Item: marshall({
+          pk: `ACTUAL#${hourDay}`,
+          sk: `${hour}#${svc}`,
+          type: "actual",
+          service: svc,
+          hourUTC: hour,
+          actual: round4(cost),
+          updatedAt: iso,
+          ttl: rowTtl,
+        }, { removeUndefinedValues: true }),
+      }));
+      actualRowsWritten++;
+    }
+  }
+  console.log(`[reconciler] 시간별 실제값 저장: ${actualRowsWritten}건 (ACTUAL#)`);
+
   // ── 2) 추정치(EST#) 창 안에서 로드 ──
   const est = await loadEstimatesInWindow(utcDays, fromUTC, toUTC);
 
