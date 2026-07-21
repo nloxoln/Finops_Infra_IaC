@@ -5,7 +5,6 @@ resource "aws_lb" "app_alb" {
   security_groups    = [aws_security_group.alb_sg.id]
   subnets            = aws_subnet.public[*].id
 
-  # [정리] ALB 액세스 로그는 미사용이라 제거 (S3 저장 비용 절감). 추정기는 CloudWatch 지표(ConsumedLCUs 등) 사용.
 
   tags = {
     Name      = "app-alb"
@@ -27,8 +26,8 @@ resource "aws_lb_target_group" "app_tg" {
     timeout             = 5
   }
 
-  # EC2 2대 구성에서 세션(로그인) 유지를 위한 고정 세션
-  # 같은 클라이언트는 항상 같은 인스턴스로 라우팅됨
+  # EC2 고정 세션
+
   stickiness {
     type            = "lb_cookie"
     cookie_duration = 86400 # 1일

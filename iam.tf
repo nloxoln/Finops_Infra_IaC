@@ -47,9 +47,6 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 
 
 
-
-
-
 # ===== CodeDeploy 서비스 역할 =====
 resource "aws_iam_role" "codedeploy_role" {
   name = "codedeploy-service-role"
@@ -72,10 +69,8 @@ resource "aws_iam_role_policy_attachment" "codedeploy" {
 
 
 
-
-
 # ===== GitHub Actions 배포용 IAM 사용자 =====
-# GitHub Secrets(AWS_ACCESS_KEY_ID/SECRET)에 넣을 자격증명.
+# GitHub Secrets(AWS_ACCESS_KEY_ID/SECRET)에 넣을 자격증명
 resource "aws_iam_user" "github_actions" {
   name = "github-actions-deployer"
 }

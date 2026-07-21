@@ -1,3 +1,5 @@
+
+# 이거 고냥 헬임. 다시 한번 보기로
 resource "aws_cloudfront_distribution" "cdn" {
   enabled             = true
   default_root_object = "index.html"
@@ -9,7 +11,7 @@ resource "aws_cloudfront_distribution" "cdn" {
     custom_origin_config {
       http_port              = 80
       https_port              = 443
-      origin_protocol_policy   = "http-only" # ALB 리스너가 HTTP만 열려있으므로. HTTPS 붙이면 "https-only"로 변경
+      origin_protocol_policy   = "http-only" # ALB 리스너가 80먼 열려있으니까 다시 443으로 들어오게 
       origin_ssl_protocols     = ["TLSv1.2"]
     }
   }
@@ -108,7 +110,7 @@ resource "aws_cloudfront_distribution" "cdn" {
     }
   }
 
-  # ACM 인증서로 HTTPS 제공 (인증서는 us-east-1, acm.tf 참조)
+  # ACM 인증서로 HTTPS 제공 (인증서는 us-east-1, acm.tf -> 리전은 us임)
   viewer_certificate {
     acm_certificate_arn      = aws_acm_certificate_validation.cdn_cert.certificate_arn
     ssl_support_method       = "sni-only"
@@ -120,5 +122,4 @@ resource "aws_cloudfront_distribution" "cdn" {
     component = "cloudfront"
   }
 
-  # [정리] CloudFront 액세스 로그는 미사용이라 제거. 추정기는 CloudWatch 지표(Requests/BytesDownloaded) 사용.
 }

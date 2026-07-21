@@ -1,7 +1,4 @@
-// index.js — anomaly-injector (이상 비용 시나리오 주입기)
 // Runtime: Node.js 20.x
-// ANOMALY_TYPE 환경변수로 4종 전환:
-//   "CACHE_MISS_SPAM" | "RDS_WRITE_SPAM" | "EC2_LOAD_SPAM" | "SALE_EVENT"
 
 const ALB_ENDPOINT = process.env.ALB_ENDPOINT;
 const CF_DOMAIN = process.env.CLOUDFRONT_DOMAIN;

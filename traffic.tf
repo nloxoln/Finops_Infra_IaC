@@ -1,21 +1,10 @@
 # =====================================================================
-# 트래픽 생성 PoC — 정상 트래픽 생성기 + 이상 주입기 (Lambda) + KST 스케줄러
-#   - traffic-generator : EventBridge Scheduler(12분 간격, 화~금 09~18 KST)로 상시 구동
-#   - anomaly-injector  : ANOMALY_TYPE 환경변수로 4종 전환, 수동/토요일 주입용
-#   - ground truth 로그는 전용 버킷(traffic_logs)에 JSON 으로 저장
+# 트래픽 주입하기 위한 코드로 실제 코드는 람다 폴더로 가면 nodejs 코드 있음
 # =====================================================================
 
-# ---------------------------------------------------------------------
-# 0) ground-truth 트래픽 로그 전용 버킷
-#    log-buckets/ 의 독립 state 에서 관리 → 여기서는 data source 로만 참조
-# ---------------------------------------------------------------------
-
-# 참고: 상품 이미지(products/1.png ~ products/16.png)는 이미 olive-product 버킷에
-#       업로드되어 있으므로 별도 업로드 리소스는 두지 않는다.
-#       인기상품 = 1~16 (HIT), 롱테일 = 17~9999 (파일 없음 → 404/MISS).
 
 # ---------------------------------------------------------------------
-# 1) Lambda 소스 zip 패키징
+# 1) 람다 소스 zip으로 만들기
 # ---------------------------------------------------------------------
 data "archive_file" "traffic_generator" {
   type        = "zip"
@@ -30,7 +19,7 @@ data "archive_file" "anomaly_injector" {
 }
 
 # ---------------------------------------------------------------------
-# 3) Lambda 실행 역할 (로그 버킷 쓰기 + CloudWatch Logs)
+# 3) Lambda 실행을 위한 역할 생성  
 # ---------------------------------------------------------------------
 resource "aws_iam_role" "traffic_lambda" {
   name = "traffic-poc-lambda-role"
@@ -63,7 +52,7 @@ resource "aws_iam_role_policy" "traffic_lambda_s3" {
 }
 
 # ---------------------------------------------------------------------
-# 4) Lambda 함수 — 정상 트래픽 생성기
+# 4) Lambda 함수 생성 - 정상적 트래픽
 # ---------------------------------------------------------------------
 resource "aws_lambda_function" "traffic_generator" {
   function_name    = "traffic-generator"
@@ -87,7 +76,7 @@ resource "aws_lambda_function" "traffic_generator" {
 }
 
 # ---------------------------------------------------------------------
-# 5) Lambda 함수 — 이상 주입기
+# 5) Lambda 함수 — 비정상적 트래픽
 # ---------------------------------------------------------------------
 resource "aws_lambda_function" "anomaly_injector" {
   function_name    = "anomaly-injector"
@@ -113,12 +102,9 @@ resource "aws_lambda_function" "anomaly_injector" {
 }
 
 # ---------------------------------------------------------------------
-# 6) EventBridge Scheduler — 12분 간격, 매일 09~18시 KST
+# 6) 이벤트 브릿지로 12분 간격, 매일 09~19시 KST(한국 시간)
 #    cron(분 시 일 월 요일 년), timezone=Asia/Seoul 로 KST 직접 표현
 #    → 매시 0/12/24/36/48분, 9~18시, "매일"(요일 무관)
-#    [변경] 발표 일정상 정상 데이터가 목·금·토·일 4일 연속 필요하고,
-#           월요일 비정상 주입 테스트 때도 정상 baseline 이 흘러야 하므로
-#           TUE-SAT → 매일(*)로 확대. (요일별 계절성은 쓰지 않고 시간대별만 사용)
 # ---------------------------------------------------------------------
 resource "aws_iam_role" "scheduler" {
   name = "traffic-scheduler-role"

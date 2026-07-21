@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e  # 에러가 발생하면 스크립트 실행을 즉시 중단하라
+set -e  # 에러가 발생하면 스크립트 실행을 즉시 중단하셈~
 
 # ===== 1) Node.js 20 설치 =====
 if ! command -v node >/dev/null 2>&1; then

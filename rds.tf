@@ -20,7 +20,7 @@ resource "aws_db_instance" "postgresql" {
   publicly_accessible    = false
   skip_final_snapshot    = true
 
-  monitoring_interval = 60   # 1~60초 단위, 우선 60초로 시작 (비용 고려, 필요시 나중에 낮추기)
+  monitoring_interval = 60   
   monitoring_role_arn = aws_iam_role.rds_monitoring.arn
 
   tags = merge(

@@ -1,4 +1,4 @@
-# GitHub Actions 가 이 애플리케이션 이름으로 배포를 트리거합니다.
+# GitHub Actions 가 이 애플리케이션 이름으로 배포를 트리거
 resource "aws_codedeploy_app" "app" {
   name             = "oliveyoung-app"
   compute_platform = "Server"

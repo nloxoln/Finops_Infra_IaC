@@ -1,7 +1,7 @@
-# ---- CodeDeploy 배포 번들 저장용 (GitHub Actions 가 zip 업로드) ----
+# ---- CodeDeploy 배포, 깃헙에서 코드를 zip으로 저장시킨다.  ----
 resource "aws_s3_bucket" "codedeploy_bundles" {
   bucket        = var.codedeploy_bucket_name
-  force_destroy = true # 배포 zip 이라 destroy 시 같이 지워져도 무방
+  force_destroy = true # 배포 zip 이라 destroy 할때 같이 지워져도 상관없심!
 
   tags = {
     Name      = "codedeploy-bundles"
@@ -49,7 +49,7 @@ resource "aws_s3_bucket_policy" "static_assets" {
   })
 }
 
-# ---- 상품 이미지 저장용 (DB에는 URL만 저장) ----
+# ---- 상품 이미지 저장용, 디비에는 클라우드 프론트 url로 해둠 ----
 resource "aws_s3_bucket" "product_images" {
   bucket = var.s3_images_bucket_name
   force_destroy = true
