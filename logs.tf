@@ -1,5 +1,5 @@
 
-# ---- CUR 데이터 담을 용 ----
+# ---- CUR 데이터 담을 용이다~ ----
 
 resource "aws_cur_report_definition" "main" {
   provider                   = aws.us_east_1
