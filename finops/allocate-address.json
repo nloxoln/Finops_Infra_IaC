@@ -1,0 +1,1 @@
+{"detail":{"eventName":"AllocateAddress","eventSource":"ec2.amazonaws.com","eventTime":"2026-07-22T02:00:00Z","awsRegion":"ap-northeast-2","sourceIPAddress":"203.0.113.42","userIdentity":{"type":"IAMUser","userName":"demo-user"},"requestParameters":{"domain":"vpc"}}}
