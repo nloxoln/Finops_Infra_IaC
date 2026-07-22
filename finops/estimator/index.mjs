@@ -48,7 +48,7 @@ const Z_CRIT = Number(process.env.Z_CRIT || 4); // 4σ 초과 ≈ 상위 0.003% 
 const MIN_SAMPLES = Number(process.env.MIN_SAMPLES || 3); // baseline 최소 표본
 const BASELINE_DAYS = Number(process.env.BASELINE_DAYS || 28); // 같은 시간대 며칠치로 baseline
 const ALERT_TTL_DAYS = Number(process.env.ALERT_TTL_DAYS || 30);
-
+const BEDROCK_API_ENDPOINT = process.env.BEDROCK_API_ENDPOINT;
 // ---------------------------------------------------------------------
 // 단가표 (ap-northeast-2 근사치, USD). 정확할 필요 없음 — 보정계수가 오차를 흡수.
 // 더 정확히 하려면 Price List API 실값으로 교체.
@@ -485,6 +485,24 @@ async function notifySlack(payload) {
   }
 }
 
+
+async function analyzeWithBedrock(payload) {
+  if (!BEDROCK_API_ENDPOINT) return null;
+  try {
+    const res = await fetch(BEDROCK_API_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) { console.warn("bedrock 분석 실패:", res.status); return null; }
+    const data = await res.json();
+    return data.analysis || null;
+  } catch (e) {
+    console.warn("bedrock 분석 예외:", e.message);
+    return null;
+  }
+}
+
 // 종합보고서(프론트 '종합보고서' 칸)에 그대로 실릴 서술형 텍스트 생성
 function buildReportText({ company, service, rule, severity, z, mean, current, mode, n, hourKey, usage }) {
   const sevLabel = severity === "CRITICAL" ? "심각(CRITICAL)" : "경고(WARNING)";
@@ -625,13 +643,26 @@ async function detectAndAlert(perService, dayUTC, hourKey, usage, endEpochSec) {
     );
 
     // 슬랙 전송 (심각도·원인·조치·콘솔경로 포함)
+    const aiAnalysis = await analyzeWithBedrock({
+      company: COMPANY_NAME,
+      service: c.service,
+      severity: c.severity,
+      rawData,
+      summary,
+      metric: { expected: round2(c.mean), actual: round2(c.current), z: round2(c.z) },
+    });
+
+    const causeText = aiAnalysis
+      ?? `${rule.cause}\n\n▶ 권장 조치: ${rule.action}\n▶ 콘솔 확인: ${rule.console}`;
+
+    // 슬랙 전송
     await notifySlack({
       company: COMPANY_NAME,
       severity: c.severity,
       service: c.service,
       rawData,
       summary,
-      cause: `${rule.cause}\n\n▶ 권장 조치: ${rule.action}\n▶ 콘솔 확인: ${rule.console}`,
+      cause: causeText,
       actionRequired: c.severity === "CRITICAL",
       metric: { expected: round2(c.mean), actual: round2(c.current), z: round2(c.z), sigma: round2(c.z) },
       detectedAt: nowIso,

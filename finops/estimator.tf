@@ -120,6 +120,7 @@ resource "aws_lambda_function" "estimator" {
       # 같은 시간대 표본 최소 3개(목·금·토 정도)면 월요일 테스트 시 탐지 가능.
       MIN_SAMPLES   = "3"
       BASELINE_DAYS = "7"
+      BEDROCK_API_ENDPOINT = "${aws_apigatewayv2_stage.bedrock_analyzer.invoke_url}/bedrock/analyze"
     }
   }
 
