@@ -39,7 +39,7 @@ resource "aws_lambda_function" "bedrock_analyzer" {
   environment {
     variables = {
       BEDROCK_REGION   = "ap-northeast-2"
-      BEDROCK_MODEL_ID = "anthropic.claude-sonnet-5"   # 2단계에서 복사한 값
+      BEDROCK_MODEL_ID = "apac.anthropic.claude-sonnet-4-5-20250929-v1:0"   # 2단계에서 복사한 값
     }
   }
 
